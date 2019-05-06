@@ -9,9 +9,11 @@ set(CDIR ${CMAKE_CURRENT_SOURCE_DIR})
 # BDIR is the build/ directory
 set(BDIR ${CMAKE_CURRENT_BINARY_DIR})
 
-find_package(glfw3 3.2 REQUIRED)
+set(VULKAN_PATH ${CDIR}/vulkansdk-macos-1.1.106.0/macOS)
+set(ENV{VULKAN_SDK} ${VULKAN_PATH}) 
 
-set(ENV{VULKAN_SDK} ${CDIR}/vulkansdk-macos-1.1.106.0/macOS) 
+find_package(glfw3 3.3 REQUIRED)
+
 find_package(vulkan REQUIRED)
 if (NOT Vulkan_FOUND)
   message("vulkan not found")
@@ -40,6 +42,12 @@ add_library(main_lib STATIC ${SOURCES})
 target_include_directories(main_lib PUBLIC include)
 # TODO - add back imgui
 target_link_libraries(main_lib PUBLIC glfw Vulkan::Vulkan) 
+# pass the manifest file locations to the exec instead of
+# specifying them on the command-line every time
+target_compile_definitions(main_lib PUBLIC
+  ENV_VK_ICD_FILENAMES="VK_ICD_FILENAMES=${VULKAN_PATH}/etc/vulkan/icd.d/MoltenVK_icd.json")
+target_compile_definitions(main_lib PUBLIC
+  ENV_VK_LAYER_PATH="VK_LAYER_PATH=${VULKAN_PATH}/etc/vulkan/explicit_layer.d")
 
 add_executable(main_exec ${DRIVER})
 target_link_libraries(main_exec PUBLIC main_lib)

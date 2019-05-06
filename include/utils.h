@@ -5,12 +5,16 @@
 #include <string>
 
 #include <cstddef>
-#include <stdlib.h>
+#include <cstdlib>
 #include <execinfo.h>
 #include <stdio.h>
 #include <unistd.h>
 
+// Note: must include vulkan before GLFW
+//#include <vulkan/vulkan.h>
+#define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+
 #define GLM_ENABLE_EXPERIMENTAL
 #include "glm/glm.hpp"
 #include "glm/gtc/matrix_transform.hpp"
