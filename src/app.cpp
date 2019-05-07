@@ -18,6 +18,11 @@
 using namespace std;
 using namespace glm;
 
+struct Vertex {
+  vec2 pos;
+  vec3 color;
+};
+
 struct AppState {
   GLFWwindow* win = nullptr;
 
@@ -63,8 +68,165 @@ VkShaderModule create_shader_module(VkDevice& device, const vector<char>& code) 
   return module;
 }
 
+uint32_t find_mem_type_index(VkPhysicalDevice& phys_device,
+    uint32_t type_filter,
+    VkMemoryPropertyFlags target_mem_flags) {
+  VkPhysicalDeviceMemoryProperties mem_props;
+  vkGetPhysicalDeviceMemoryProperties(phys_device, &mem_props);
+
+  uint32_t mem_type_index = 0;
+  bool found_mem_type = false;
+  for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+    bool mem_type_supported = type_filter & (1 << i);
+    bool has_target_props = (mem_props.memoryTypes[i].propertyFlags &
+      target_mem_flags) == target_mem_flags;
+    if (mem_type_supported && has_target_props) {
+      mem_type_index = i;
+      found_mem_type = true;
+      break;
+    }
+  }
+  assert(found_mem_type);
+  return mem_type_index;
+}
+
+void copy_buffer(
+    VkDevice& device,
+    VkQueue& queue,
+    VkCommandPool& cmd_pool,
+    VkBuffer src_buffer, VkBuffer dst_buffer,
+    VkDeviceSize buffer_size) {
+  // the copy requires a temporary command buffer
+  VkCommandBufferAllocateInfo alloc_info = {
+    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+    .commandPool = cmd_pool,
+    .commandBufferCount = 1
+  };
+  VkCommandBuffer tmp_cmd_buffer;
+  vkAllocateCommandBuffers(device, &alloc_info, &tmp_cmd_buffer);
+  VkCommandBufferBeginInfo begin_info = {
+    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  };
+
+  vkBeginCommandBuffer(tmp_cmd_buffer, &begin_info);
+  VkBufferCopy copy_region = {
+    .srcOffset = 0,
+    .dstOffset = 0,
+    .size = buffer_size
+  };
+  vkCmdCopyBuffer(tmp_cmd_buffer, src_buffer, dst_buffer,
+      1, &copy_region);
+  vkEndCommandBuffer(tmp_cmd_buffer);
+
+  VkSubmitInfo copy_submit_info = {
+    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+    .commandBufferCount = 1,
+    .pCommandBuffers = &tmp_cmd_buffer
+  };
+  vkQueueSubmit(queue, 1, &copy_submit_info, VK_NULL_HANDLE);
+  vkQueueWaitIdle(queue);
+
+  vkFreeCommandBuffers(device, cmd_pool, 1, &tmp_cmd_buffer);
+}
+
+void create_buffer(
+    VkDevice device,
+    VkPhysicalDevice phys_device,
+    VkDeviceSize size, VkBufferUsageFlags usage,
+    VkMemoryPropertyFlags props, VkBuffer& buffer, VkDeviceMemory& buffer_mem) {
+  VkBufferCreateInfo buffer_info = {
+    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    .size = size,
+    .usage = usage,
+    .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+  };
+  VkResult res = vkCreateBuffer(device, &buffer_info, nullptr, &buffer);
+  assert(res == VK_SUCCESS);
+
+  VkMemoryRequirements mem_reqs;
+  vkGetBufferMemoryRequirements(device, buffer, &mem_reqs);
+
+  uint32_t mem_type_index = find_mem_type_index(
+      phys_device, mem_reqs.memoryTypeBits, props);
+  VkMemoryAllocateInfo alloc_info = {
+    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+    .allocationSize = mem_reqs.size,
+    .memoryTypeIndex = mem_type_index
+  };
+  res = vkAllocateMemory(device, &alloc_info, nullptr, &buffer_mem);
+  assert(res == VK_SUCCESS);
+
+  vkBindBufferMemory(device, buffer, buffer_mem, 0);
+}
+
+void create_index_buffer(
+    VkDevice& device,
+    VkPhysicalDevice& phys_device,
+    VkQueue& queue,
+    VkCommandPool& cmd_pool,
+    vector<uint16_t>& indices,
+    VkBuffer& index_buffer, VkDeviceMemory& index_buffer_mem) {
+  VkDeviceSize buffer_size = sizeof(indices[0]) * indices.size();
+
+  VkBuffer staging_buffer;
+  VkDeviceMemory staging_buffer_mem;
+  create_buffer(device, phys_device, buffer_size,
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      staging_buffer, staging_buffer_mem);
+
+  void* data;
+  vkMapMemory(device, staging_buffer_mem, 0, buffer_size, 0, &data);
+  memcpy(data, indices.data(), (size_t) buffer_size);
+  vkUnmapMemory(device, staging_buffer_mem);
+
+  create_buffer(device, phys_device, buffer_size,
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        index_buffer, index_buffer_mem);
+
+  copy_buffer(device, queue, cmd_pool,
+      staging_buffer, index_buffer, buffer_size);
+
+  vkDestroyBuffer(device, staging_buffer, nullptr);
+  vkFreeMemory(device, staging_buffer_mem, nullptr);
+}
+
 void init_vulkan(AppState& state) {
   VkResult res;
+
+  vector<Vertex> vertices = {
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+  };
+  vector<uint16_t> indices = {
+    0, 1, 2,
+    2, 3, 0
+  };
+  VkVertexInputBindingDescription binding_desc = {
+    .binding = 0,
+    .stride = sizeof(Vertex),
+    .inputRate = VK_VERTEX_INPUT_RATE_VERTEX
+  };
+  array<VkVertexInputAttributeDescription, 2> attr_descs;
+  attr_descs[0] = {
+    .binding = 0,
+    .location = 0,
+    .format = VK_FORMAT_R32G32_SFLOAT,
+    .offset = offsetof(Vertex, pos)
+  };
+  attr_descs[1] = {
+    .binding = 0,
+    .location = 1,
+    .format = VK_FORMAT_R32G32B32_SFLOAT,
+    .offset = offsetof(Vertex, color)
+  };
   
   // enumerate instance extensions
   uint32_t num_exts = 0;
@@ -113,7 +275,7 @@ void init_vulkan(AppState& state) {
     .engineVersion = 1,
     .apiVersion = VK_API_VERSION_1_0
   };
-    VkInstanceCreateInfo inst_info = {
+  VkInstanceCreateInfo inst_info = {
     .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
     .pNext = nullptr,
     .flags = 0,
@@ -180,6 +342,7 @@ void init_vulkan(AppState& state) {
       queue_fam_props.data());
   assert(queue_family_count > 0);
 
+  // find a suitable queue family
   bool found_index = false;
   uint32_t target_family_index = 0;
   printf("queue families:\n");
@@ -199,6 +362,8 @@ void init_vulkan(AppState& state) {
   }
   printf("\n");
   assert(found_index);
+
+  // init logical device
 
   float queue_priority = 1.0f;
   VkDeviceQueueCreateInfo queue_info = {
@@ -265,7 +430,7 @@ void init_vulkan(AppState& state) {
   }
   assert(found_format);
 
-  // guarenteed to be supported?
+  // guaranteed to be supported?
   VkPresentModeKHR target_present_mode = VK_PRESENT_MODE_FIFO_KHR;
 
   VkExtent2D target_extent = surface_caps.currentExtent;
@@ -392,10 +557,10 @@ void init_vulkan(AppState& state) {
 
   VkPipelineVertexInputStateCreateInfo vertex_input_info = {
     .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-    .vertexBindingDescriptionCount = 0,
-    .pVertexBindingDescriptions = nullptr,
-    .vertexAttributeDescriptionCount = 0,
-    .pVertexAttributeDescriptions = nullptr
+    .vertexBindingDescriptionCount = 1,
+    .pVertexBindingDescriptions = &binding_desc,
+    .vertexAttributeDescriptionCount = (uint32_t) attr_descs.size(),
+    .pVertexAttributeDescriptions = attr_descs.data()
   };
 
   VkPipelineInputAssemblyStateCreateInfo input_assembly_info = {
@@ -520,6 +685,46 @@ void init_vulkan(AppState& state) {
       &cmd_pool);
   assert(res == VK_SUCCESS);
 
+  // init vertex buffers
+
+  VkDeviceSize buffer_size = sizeof(vertices[0]) * vertices.size();
+
+  VkBuffer staging_buffer;
+  VkDeviceMemory staging_buffer_mem;
+  create_buffer(device, phys_device,
+      buffer_size,
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      staging_buffer, staging_buffer_mem);
+
+  VkBuffer vert_buffer;
+  VkDeviceMemory vert_buffer_mem;
+  create_buffer(device, phys_device,
+      buffer_size,
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      vert_buffer, vert_buffer_mem);
+
+  // upload vertex data to vertex buffer mem
+  void* mapped_data;
+  vkMapMemory(device, staging_buffer_mem, 0, buffer_size, 0, 
+    &mapped_data);
+  memcpy(mapped_data, vertices.data(), (size_t) buffer_size);
+  vkUnmapMemory(device, staging_buffer_mem);
+
+  copy_buffer(device, queue, cmd_pool, staging_buffer,
+      vert_buffer, buffer_size);
+
+  vkDestroyBuffer(device, staging_buffer, nullptr);
+  vkFreeMemory(device, staging_buffer_mem, nullptr);
+
+  VkBuffer index_buffer;
+  VkDeviceMemory index_buffer_mem;
+  create_index_buffer(device, phys_device, queue, cmd_pool,
+      indices, index_buffer, index_buffer_mem);
+  
   // init cmd buffers
   vector<VkCommandBuffer> cmd_buffers(swapchain_framebuffers.size());
   VkCommandBufferAllocateInfo cmd_buffer_info = {
@@ -552,16 +757,26 @@ void init_vulkan(AppState& state) {
       .clearValueCount = 1,
       .pClearValues = &clear_color
     };
+    vector<VkBuffer> vert_buffers = {vert_buffer};
+    vector<VkDeviceSize> byte_offsets = {0};
+
     vkCmdBeginRenderPass(cmd_buffers[i], &render_pass_info,
         VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd_buffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS,
         graphics_pipeline);
-    vkCmdDraw(cmd_buffers[i], 3, 1, 0, 0);
+    vkCmdBindVertexBuffers(cmd_buffers[i], 0, vert_buffers.size(),
+        vert_buffers.data(), byte_offsets.data());
+    vkCmdBindIndexBuffer(cmd_buffers[i], index_buffer, 0,
+        VK_INDEX_TYPE_UINT16);
+    //vkCmdDraw(cmd_buffers[i], (uint32_t) vertices.size(), 1, 0, 0);
+    vkCmdDrawIndexed(cmd_buffers[i], (uint32_t) indices.size(),
+        1, 0, 0, 0);
     vkCmdEndRenderPass(cmd_buffers[i]);
     res = vkEndCommandBuffer(cmd_buffers[i]);
     assert(res == VK_SUCCESS);
   }
 
+  // create synchronization objects
   const int max_frames_in_flight = 2;
   vector<VkSemaphore> img_available_semas(max_frames_in_flight);
   vector<VkSemaphore> render_done_semas(max_frames_in_flight);
@@ -633,6 +848,10 @@ void init_vulkan(AppState& state) {
   vkDeviceWaitIdle(device);
   
   // cleanup
+  vkDestroyBuffer(device, index_buffer, nullptr);
+  vkFreeMemory(device, index_buffer_mem, nullptr);
+  vkDestroyBuffer(device, vert_buffer, nullptr);
+  vkFreeMemory(device, vert_buffer_mem, nullptr);
   for (int i = 0; i < max_frames_in_flight; ++i) {
     vkDestroySemaphore(device, render_done_semas[i], nullptr);
     vkDestroySemaphore(device, img_available_semas[i], nullptr);
