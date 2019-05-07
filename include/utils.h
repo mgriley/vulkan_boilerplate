@@ -16,6 +16,10 @@
 #include <GLFW/glfw3.h>
 
 #define GLM_ENABLE_EXPERIMENTAL
+// used to meet vulkan alignment requirements when memcpy-ing
+// struct data to GPU buffer memory
+// Note that it may break down for nested structs
+#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
 #include "glm/glm.hpp"
 #include "glm/gtc/matrix_transform.hpp"
 #include "glm/gtx/string_cast.hpp"

@@ -23,6 +23,12 @@ struct Vertex {
   vec3 color;
 };
 
+struct UniformBufferObject {
+  mat4 model;
+  mat4 view;
+  mat4 proj;
+};
+
 struct AppState {
   GLFWwindow* win = nullptr;
 
@@ -532,7 +538,25 @@ void init_vulkan(AppState& state) {
   res = vkCreateRenderPass(device, &render_pass_info, nullptr, &render_pass);
   assert(res == VK_SUCCESS);
 
-  // create graphics pipeline
+  // create descriptor set layout
+
+  VkDescriptorSetLayoutBinding ubo_layout_binding = {
+    .binding = 0,
+    .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+    .descriptorCount = 1,
+    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+    .pImmutableSamplers = nullptr
+  };
+  VkDescriptorSetLayoutCreateInfo layout_info = {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+    .bindingCount = 1,
+    .pBindings = &ubo_layout_binding
+  };
+  VkDescriptorSetLayout desc_set_layout;
+  res = vkCreateDescriptorSetLayout(device, &layout_info, nullptr,
+      &desc_set_layout);
+
+  // init graphics pipeline
 
   auto vert_shader_code = read_file("../shaders/vert.spv");
   auto frag_shader_code = read_file("../shaders/frag.spv");
@@ -595,7 +619,7 @@ void init_vulkan(AppState& state) {
     .polygonMode = VK_POLYGON_MODE_FILL,
     .lineWidth = 1.0f,
     .cullMode = VK_CULL_MODE_BACK_BIT,
-    .frontFace = VK_FRONT_FACE_CLOCKWISE,
+    .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
     .depthBiasEnable = VK_FALSE,
     .depthBiasConstantFactor = 0.0f,
     .depthBiasClamp = 0.0f,
@@ -621,9 +645,11 @@ void init_vulkan(AppState& state) {
     .attachmentCount = 1,
     .pAttachments = &color_blend_attachment
   };
-  // TODO - will return to this later for specifying uniforms
+  // descriptor sets for uniforms go here
   VkPipelineLayoutCreateInfo pipeline_layout_info = {
     .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+    .setLayoutCount = 1,
+    .pSetLayouts = &desc_set_layout
   };
   VkPipelineLayout pipeline_layout;
   res = vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
@@ -720,10 +746,77 @@ void init_vulkan(AppState& state) {
   vkDestroyBuffer(device, staging_buffer, nullptr);
   vkFreeMemory(device, staging_buffer_mem, nullptr);
 
+  // init index buffer
+
   VkBuffer index_buffer;
   VkDeviceMemory index_buffer_mem;
   create_index_buffer(device, phys_device, queue, cmd_pool,
       indices, index_buffer, index_buffer_mem);
+
+  // init uniform buffers
+
+  vector<VkBuffer> unif_buffers(swapchain_img_views.size());
+  vector<VkDeviceMemory> unif_buffers_mem(swapchain_img_views.size());
+  VkDeviceSize unif_buffer_size = sizeof(UniformBufferObject);
+  for (size_t i = 0; i < swapchain_img_views.size(); ++i) {
+    create_buffer(device, phys_device, unif_buffer_size,
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        unif_buffers[i], unif_buffers_mem[i]);
+  }
+
+  // init descriptor pool
+
+  VkDescriptorPoolSize pool_size = {
+    .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+    .descriptorCount = (uint32_t) swapchain_img_views.size()
+  };
+  VkDescriptorPoolCreateInfo desc_pool_info = {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+    .poolSizeCount = 1,
+    .pPoolSizes = &pool_size,
+    .maxSets = (uint32_t) swapchain_img_views.size()
+  };
+  VkDescriptorPool desc_pool;
+  res = vkCreateDescriptorPool(device, &desc_pool_info, nullptr,
+      &desc_pool);
+  assert(res == VK_SUCCESS);
+
+  // init desc sets
+
+  vector<VkDescriptorSetLayout> desc_set_layouts(
+      swapchain_img_views.size(), desc_set_layout);
+  VkDescriptorSetAllocateInfo desc_set_alloc_info = {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+    .descriptorPool = desc_pool,
+    .descriptorSetCount = (uint32_t) desc_set_layouts.size(),
+    .pSetLayouts = desc_set_layouts.data()
+  };
+  vector<VkDescriptorSet> desc_sets(desc_set_layouts.size());
+  res = vkAllocateDescriptorSets(device, &desc_set_alloc_info,
+      desc_sets.data());
+  assert(res == VK_SUCCESS);
+  
+  for (size_t i = 0; i < desc_sets.size(); ++i) {
+    VkDescriptorBufferInfo buffer_info = {
+      .buffer = unif_buffers[i],
+      .offset = 0,
+      .range = sizeof(UniformBufferObject)
+    };
+    VkWriteDescriptorSet desc_write = {
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet = desc_sets[i],
+      .dstBinding = 0,
+      .dstArrayElement = 0,
+      .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+      .descriptorCount = 1,
+      .pBufferInfo = &buffer_info,
+      .pImageInfo = nullptr,
+      .pTexelBufferView = nullptr
+    };
+    vkUpdateDescriptorSets(device, 1, &desc_write, 0, nullptr);
+  }
   
   // init cmd buffers
   vector<VkCommandBuffer> cmd_buffers(swapchain_framebuffers.size());
@@ -768,6 +861,8 @@ void init_vulkan(AppState& state) {
         vert_buffers.data(), byte_offsets.data());
     vkCmdBindIndexBuffer(cmd_buffers[i], index_buffer, 0,
         VK_INDEX_TYPE_UINT16);
+    vkCmdBindDescriptorSets(cmd_buffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS,
+        pipeline_layout, 0, 1, &desc_sets[i], 0, nullptr);
     //vkCmdDraw(cmd_buffers[i], (uint32_t) vertices.size(), 1, 0, 0);
     vkCmdDrawIndexed(cmd_buffers[i], (uint32_t) indices.size(),
         1, 0, 0, 0);
@@ -814,7 +909,27 @@ void init_vulkan(AppState& state) {
         std::numeric_limits<uint64_t>::max(),
         img_available_semas[current_frame],
         VK_NULL_HANDLE, &img_index);
+    
+    // update the unif buffers
+    mat4 model_mat = mat4(1.0f);
+    mat4 view_mat = glm::lookAt(vec3(2.0f), vec3(0.0f),
+        vec3(0.0f, 1.0f, 0.0f));
+    float aspect_ratio = target_extent.width / (float) target_extent.height;
+    mat4 proj_mat = glm::perspective(45.0f, aspect_ratio, 0.1f, 10.0f);
+    // invert Y b/c vulkan's y-axis is inverted wrt OpenGL
+    proj_mat[1][1] *= -1;
+    UniformBufferObject ubo = {
+      .model = model_mat,
+      .view = view_mat,
+      .proj = proj_mat
+    };
+    void* unif_data;
+    vkMapMemory(device, unif_buffers_mem[img_index], 0,
+        sizeof(ubo), 0, &unif_data);
+    memcpy(unif_data, &ubo, sizeof(ubo));
+    vkUnmapMemory(device, unif_buffers_mem[img_index]);
 
+    // submit cmd buffer to pipeline
     vector<VkPipelineStageFlags> wait_stages = {
       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
     };
@@ -832,6 +947,7 @@ void init_vulkan(AppState& state) {
         in_flight_fences[current_frame]);
     assert(res == VK_SUCCESS);
 
+    // present result when done
     VkPresentInfoKHR present_info = {
       .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
       .waitSemaphoreCount = 1,
@@ -848,6 +964,12 @@ void init_vulkan(AppState& state) {
   vkDeviceWaitIdle(device);
   
   // cleanup
+  for (size_t i = 0; i < swapchain_img_views.size(); ++i) {
+    vkDestroyBuffer(device, unif_buffers[i], nullptr);
+    vkFreeMemory(device, unif_buffers_mem[i], nullptr);
+  }
+  vkDestroyDescriptorPool(device, desc_pool, nullptr);
+  vkDestroyDescriptorSetLayout(device, desc_set_layout, nullptr);
   vkDestroyBuffer(device, index_buffer, nullptr);
   vkFreeMemory(device, index_buffer_mem, nullptr);
   vkDestroyBuffer(device, vert_buffer, nullptr);
