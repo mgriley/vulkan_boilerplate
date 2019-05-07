@@ -20,6 +20,8 @@
 // struct data to GPU buffer memory
 // Note that it may break down for nested structs
 #define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
+// Use 0.0 to 1.0 instead of -1.0 to 1.0 for the perspective proj matrix
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include "glm/glm.hpp"
 #include "glm/gtc/matrix_transform.hpp"
 #include "glm/gtx/string_cast.hpp"
