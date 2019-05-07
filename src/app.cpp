@@ -23,6 +23,7 @@ const int max_frames_in_flight = 2;
 struct Vertex {
   vec3 pos;
   vec3 color;
+  vec2 tex_coord;
 };
 
 struct UniformBufferObject {
@@ -37,7 +38,7 @@ struct AppState {
   PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_utils;
 
   VkVertexInputBindingDescription binding_desc;
-  array<VkVertexInputAttributeDescription, 2> attr_descs;
+  array<VkVertexInputAttributeDescription, 3> attr_descs;
 
   VkInstance inst;
   VkDebugUtilsMessengerEXT debug_messenger;
@@ -80,6 +81,11 @@ struct AppState {
   vector<VkSemaphore> img_available_semas;
   vector<VkSemaphore> render_done_semas;
   vector<VkFence> in_flight_fences;
+
+  VkImage texture_img;
+  VkDeviceMemory texture_img_mem;
+  VkImageView texture_img_view;
+  VkSampler texture_sampler;
 
   size_t current_frame;
 
@@ -147,27 +153,47 @@ uint32_t find_mem_type_index(VkPhysicalDevice& phys_device,
   return mem_type_index;
 }
 
-void copy_buffer(
-    VkDevice& device,
-    VkQueue& queue,
-    VkCommandPool& cmd_pool,
-    VkBuffer src_buffer, VkBuffer dst_buffer,
-    VkDeviceSize buffer_size) {
-  // the copy requires a temporary command buffer
+VkCommandBuffer begin_single_time_commands(AppState& state) {
   VkCommandBufferAllocateInfo alloc_info = {
     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
     .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-    .commandPool = cmd_pool,
+    .commandPool = state.cmd_pool,
     .commandBufferCount = 1
   };
   VkCommandBuffer tmp_cmd_buffer;
-  vkAllocateCommandBuffers(device, &alloc_info, &tmp_cmd_buffer);
+  vkAllocateCommandBuffers(state.device, &alloc_info, &tmp_cmd_buffer);
+
   VkCommandBufferBeginInfo begin_info = {
     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
   };
-
   vkBeginCommandBuffer(tmp_cmd_buffer, &begin_info);
+
+  return tmp_cmd_buffer;
+}
+
+void end_single_time_commands(AppState& state, VkCommandBuffer cmd_buffer) {
+  vkEndCommandBuffer(cmd_buffer);
+
+  VkSubmitInfo submit_info = {
+    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+    .commandBufferCount = 1,
+    .pCommandBuffers = &cmd_buffer
+  };
+  vkQueueSubmit(state.queue, 1, &submit_info, VK_NULL_HANDLE);
+  vkQueueWaitIdle(state.queue);
+
+  vkFreeCommandBuffers(state.device, state.cmd_pool, 1, &cmd_buffer);
+}
+
+
+
+void copy_buffer(
+    AppState& state,
+    VkBuffer src_buffer, VkBuffer dst_buffer,
+    VkDeviceSize buffer_size) {
+  VkCommandBuffer tmp_cmd_buffer = begin_single_time_commands(state);
+
   VkBufferCopy copy_region = {
     .srcOffset = 0,
     .dstOffset = 0,
@@ -175,17 +201,8 @@ void copy_buffer(
   };
   vkCmdCopyBuffer(tmp_cmd_buffer, src_buffer, dst_buffer,
       1, &copy_region);
-  vkEndCommandBuffer(tmp_cmd_buffer);
-
-  VkSubmitInfo copy_submit_info = {
-    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-    .commandBufferCount = 1,
-    .pCommandBuffers = &tmp_cmd_buffer
-  };
-  vkQueueSubmit(queue, 1, &copy_submit_info, VK_NULL_HANDLE);
-  vkQueueWaitIdle(queue);
-
-  vkFreeCommandBuffers(device, cmd_pool, 1, &tmp_cmd_buffer);
+  
+  end_single_time_commands(state, tmp_cmd_buffer);
 }
 
 void create_buffer(
@@ -219,38 +236,35 @@ void create_buffer(
 }
 
 void create_index_buffer(
-    VkDevice& device,
-    VkPhysicalDevice& phys_device,
-    VkQueue& queue,
-    VkCommandPool& cmd_pool,
+    AppState& state,
     vector<uint16_t>& indices,
     VkBuffer& index_buffer, VkDeviceMemory& index_buffer_mem) {
   VkDeviceSize buffer_size = sizeof(indices[0]) * indices.size();
 
   VkBuffer staging_buffer;
   VkDeviceMemory staging_buffer_mem;
-  create_buffer(device, phys_device, buffer_size,
+  create_buffer(state.device, state.phys_device, buffer_size,
       VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
       staging_buffer, staging_buffer_mem);
 
   void* data;
-  vkMapMemory(device, staging_buffer_mem, 0, buffer_size, 0, &data);
+  vkMapMemory(state.device, staging_buffer_mem, 0, buffer_size, 0, &data);
   memcpy(data, indices.data(), (size_t) buffer_size);
-  vkUnmapMemory(device, staging_buffer_mem);
+  vkUnmapMemory(state.device, staging_buffer_mem);
 
-  create_buffer(device, phys_device, buffer_size,
+  create_buffer(state.device, state.phys_device, buffer_size,
       VK_BUFFER_USAGE_TRANSFER_DST_BIT |
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         index_buffer, index_buffer_mem);
 
-  copy_buffer(device, queue, cmd_pool,
+  copy_buffer(state,
       staging_buffer, index_buffer, buffer_size);
 
-  vkDestroyBuffer(device, staging_buffer, nullptr);
-  vkFreeMemory(device, staging_buffer_mem, nullptr);
+  vkDestroyBuffer(state.device, staging_buffer, nullptr);
+  vkFreeMemory(state.device, staging_buffer_mem, nullptr);
 }
 
 VkFormat find_supported_format(VkPhysicalDevice& phys_device,
@@ -329,6 +343,12 @@ void setup_vertex_attr_desc(AppState& state) {
     .location = 1,
     .format = VK_FORMAT_R32G32B32_SFLOAT,
     .offset = offsetof(Vertex, color)
+  };
+  state.attr_descs[2] = {
+    .binding = 0,
+    .location = 2,
+    .format = VK_FORMAT_R32G32_SFLOAT,
+    .offset = offsetof(Vertex, tex_coord)
   };
 }
 
@@ -525,6 +545,27 @@ void prepare_surface_creation(AppState& state) {
       state.surface_caps.minImageCount, state.surface_caps.maxImageCount);
 }
 
+VkImageView create_image_view(AppState& state, VkImage image, VkFormat format) {
+  VkImageViewCreateInfo view_info = {
+    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+    .image = image,
+    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+    .format = format,
+    .subresourceRange = {
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .baseMipLevel = 0,
+      .levelCount = 1,
+      .baseArrayLayer = 0,
+      .layerCount = 1
+    }
+  };
+  VkImageView img_view;
+  VkResult res = vkCreateImageView(state.device, &view_info,
+      nullptr, &img_view);
+  assert(res == VK_SUCCESS);
+  return img_view;
+}
+
 void setup_swapchain(AppState& state) {
   VkSwapchainCreateInfoKHR swapchain_info = {
     .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
@@ -558,24 +599,8 @@ void setup_swapchain(AppState& state) {
   // create image views
   state.swapchain_img_views.resize(state.swapchain_images.size());
   for (int i = 0; i < state.swapchain_images.size(); ++i) {
-    VkImageViewCreateInfo img_view_info = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-      .image = state.swapchain_images[i],
-      .viewType = VK_IMAGE_VIEW_TYPE_2D,
-      .format = state.target_format.format,
-      .components.r = VK_COMPONENT_SWIZZLE_IDENTITY,
-      .components.g = VK_COMPONENT_SWIZZLE_IDENTITY,
-      .components.b = VK_COMPONENT_SWIZZLE_IDENTITY,
-      .components.a = VK_COMPONENT_SWIZZLE_IDENTITY,
-      .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-      .subresourceRange.baseMipLevel = 0,
-      .subresourceRange.levelCount = 1,
-      .subresourceRange.baseArrayLayer = 0,
-      .subresourceRange.layerCount = 1
-    };
-    res = vkCreateImageView(state.device, &img_view_info,
-        nullptr, &state.swapchain_img_views[i]);
-    assert(res == VK_SUCCESS);
+    state.swapchain_img_views[i] = create_image_view(state,
+        state.swapchain_images[i], state.target_format.format);
   }
 }
 
@@ -630,10 +655,20 @@ void setup_descriptor_set_layout(AppState& state) {
     .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
     .pImmutableSamplers = nullptr
   };
+  VkDescriptorSetLayoutBinding sampler_layout_binding = {
+    .binding = 1,
+    .descriptorCount = 1,
+    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+    .pImmutableSamplers = nullptr,
+    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT
+  };
+  vector<VkDescriptorSetLayoutBinding> bindings = {
+    ubo_layout_binding, sampler_layout_binding
+  };
   VkDescriptorSetLayoutCreateInfo layout_info = {
     .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-    .bindingCount = 1,
-    .pBindings = &ubo_layout_binding
+    .bindingCount = (uint32_t) bindings.size(),
+    .pBindings = bindings.data()
   };
   VkResult res = vkCreateDescriptorSetLayout(state.device, &layout_info, nullptr,
       &state.desc_set_layout);
@@ -791,6 +826,186 @@ void setup_command_pool(AppState& state) {
   assert(res == VK_SUCCESS);
 }
 
+void create_image(AppState& state, uint32_t w, uint32_t h,
+    VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage,
+    VkMemoryPropertyFlags mem_props, VkImage& image,
+    VkDeviceMemory& image_mem) {
+
+  VkImageCreateInfo img_info = {
+    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+    .imageType = VK_IMAGE_TYPE_2D,
+    .extent.width = w,
+    .extent.height = h,
+    .extent.depth = 1,
+    .mipLevels = 1,
+    .arrayLayers = 1,
+    .format = format,
+    .tiling = tiling,
+    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    .usage = usage,
+    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    .samples = VK_SAMPLE_COUNT_1_BIT,
+    .flags = 0
+  };
+  VkResult res = vkCreateImage(state.device, &img_info,
+      nullptr, &image);
+  assert(res == VK_SUCCESS);
+
+  VkMemoryRequirements mem_reqs;
+  vkGetImageMemoryRequirements(state.device, image, &mem_reqs);
+  VkMemoryAllocateInfo alloc_info = {
+    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+    .allocationSize = mem_reqs.size,
+    .memoryTypeIndex = find_mem_type_index(state.phys_device,
+        mem_reqs.memoryTypeBits, mem_props)
+  };
+  res = vkAllocateMemory(state.device, &alloc_info, nullptr,
+    &image_mem);
+  assert(res == VK_SUCCESS);
+
+  vkBindImageMemory(state.device, image, image_mem, 0); 
+}
+
+void copy_buffer_to_image(AppState& state, VkBuffer buffer,
+    VkImage image, uint32_t w, uint32_t h) {
+  VkCommandBuffer tmp_cmd_buffer = begin_single_time_commands(state);
+
+  VkBufferImageCopy region = {
+    .bufferOffset = 0,
+    .bufferRowLength = 0,
+    .bufferImageHeight = 0,
+    .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+    .imageSubresource.mipLevel = 0,
+    .imageSubresource.baseArrayLayer = 0,
+    .imageSubresource.layerCount = 1,
+    .imageOffset = {0, 0, 0},
+    .imageExtent = {w, h, 1}
+  };
+  vkCmdCopyBufferToImage(tmp_cmd_buffer, buffer, image,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+  end_single_time_commands(state, tmp_cmd_buffer);
+}
+
+void transition_image_layout(AppState& state, VkImage img,
+    VkFormat format, VkImageLayout old_layout, VkImageLayout new_layout) {
+  VkCommandBuffer tmp_cmd_buffer = begin_single_time_commands(state);
+
+  VkAccessFlags src_access, dst_access;
+  VkPipelineStageFlags src_stage, dst_stage;
+
+  if (old_layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+      new_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    src_access = 0;
+    dst_access = VK_ACCESS_TRANSFER_WRITE_BIT;
+    src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  } else if (old_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+      new_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    src_access = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dst_access = VK_ACCESS_SHADER_READ_BIT;
+    src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  } else {
+    throw std::invalid_argument("unsupported layout transition");
+  }
+
+  VkImageMemoryBarrier barrier = {
+    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+    .oldLayout = old_layout,
+    .newLayout = new_layout,
+    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .image = img,
+    .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+    .subresourceRange.baseMipLevel = 0,
+    .subresourceRange.levelCount = 1,
+    .subresourceRange.baseArrayLayer = 0,
+    .subresourceRange.layerCount = 1,
+    .srcAccessMask = src_access,
+    .dstAccessMask = dst_access
+  };
+  vkCmdPipelineBarrier(tmp_cmd_buffer,
+      src_stage, dst_stage,
+      0,
+      0, nullptr,
+      0, nullptr,
+      1, &barrier);
+
+  end_single_time_commands(state, tmp_cmd_buffer);
+}
+
+void setup_texture_image(AppState& state) {
+  int tex_w, tex_h, tex_channels;
+  stbi_uc* pixels = stbi_load("../textures/sample_tex.jpg",
+      &tex_w, &tex_h, &tex_channels, STBI_rgb_alpha);
+  VkDeviceSize img_size = tex_w * tex_h * 4;
+  assert(pixels);
+
+  VkBuffer staging_buffer;
+  VkDeviceMemory staging_buffer_mem;
+
+  create_buffer(state.device, state.phys_device, img_size,
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      staging_buffer, staging_buffer_mem);
+  void* data;
+  vkMapMemory(state.device, staging_buffer_mem, 0, img_size, 0, &data);
+  memcpy(data, pixels, (size_t) img_size);
+  vkUnmapMemory(state.device, staging_buffer_mem);
+  
+  stbi_image_free(pixels);
+
+  create_image(state, tex_w, tex_h, VK_FORMAT_R8G8B8A8_UNORM,
+      VK_IMAGE_TILING_OPTIMAL,
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+        VK_IMAGE_USAGE_SAMPLED_BIT,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      state.texture_img, state.texture_img_mem);
+
+  transition_image_layout(state, state.texture_img,
+      VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  copy_buffer_to_image(state, staging_buffer, state.texture_img, (uint32_t) tex_w,
+      (uint32_t) tex_h);
+  transition_image_layout(state, state.texture_img,
+      VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+  vkDestroyBuffer(state.device, staging_buffer, nullptr);
+  vkFreeMemory(state.device, staging_buffer_mem, nullptr);
+}
+
+void setup_texture_image_view(AppState& state) {
+  state.texture_img_view = create_image_view(state,
+      state.texture_img, VK_FORMAT_R8G8B8A8_UNORM);
+}
+
+void setup_texture_sampler(AppState& state) {
+  VkSamplerCreateInfo sampler_info = {
+    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+    .magFilter = VK_FILTER_LINEAR,
+    .minFilter = VK_FILTER_LINEAR,
+    .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+    .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+    .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+    .anisotropyEnable = VK_FALSE,
+    .maxAnisotropy = 1,
+    .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+    .unnormalizedCoordinates = VK_FALSE,
+    .compareEnable = VK_FALSE,
+    .compareOp = VK_COMPARE_OP_ALWAYS,
+    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+    .mipLodBias = 0.0f,
+    .minLod = 0.0f,
+    .maxLod = 0.0f
+  };
+  VkResult res = vkCreateSampler(state.device, &sampler_info,
+      nullptr, &state.texture_sampler);
+  assert(res == VK_SUCCESS);
+}
+
 void setup_depth_resources(AppState& state) {
   VkFormat depth_format = find_depth_format(state.phys_device);
   // TODO - left off here
@@ -822,7 +1037,7 @@ void setup_vertex_buffer(AppState& state, vector<Vertex>& vertices) {
   memcpy(mapped_data, vertices.data(), (size_t) buffer_size);
   vkUnmapMemory(state.device, staging_buffer_mem);
 
-  copy_buffer(state.device, state.queue, state.cmd_pool, staging_buffer,
+  copy_buffer(state, staging_buffer,
       state.vert_buffer, buffer_size);
 
   vkDestroyBuffer(state.device, staging_buffer, nullptr);
@@ -830,8 +1045,7 @@ void setup_vertex_buffer(AppState& state, vector<Vertex>& vertices) {
 }
 
 void setup_index_buffer(AppState& state, vector<uint16_t>& indices) {
-  create_index_buffer(state.device, state.phys_device,
-      state.queue, state.cmd_pool,
+  create_index_buffer(state,
       indices, state.index_buffer, state.index_buffer_mem);
 }
 
@@ -849,14 +1063,19 @@ void setup_uniform_buffers(AppState& state) {
 }
 
 void setup_descriptor_pool(AppState& state) {
-  VkDescriptorPoolSize pool_size = {
+  vector<VkDescriptorPoolSize> pool_sizes(2);
+  pool_sizes[0] = {
     .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+    .descriptorCount = (uint32_t) state.swapchain_img_views.size()
+  };
+  pool_sizes[1] = {
+    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
     .descriptorCount = (uint32_t) state.swapchain_img_views.size()
   };
   VkDescriptorPoolCreateInfo desc_pool_info = {
     .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-    .poolSizeCount = 1,
-    .pPoolSizes = &pool_size,
+    .poolSizeCount = (uint32_t) pool_sizes.size(),
+    .pPoolSizes = pool_sizes.data(),
     .maxSets = (uint32_t) state.swapchain_img_views.size()
   };
   VkResult res = vkCreateDescriptorPool(state.device, &desc_pool_info,
@@ -884,7 +1103,13 @@ void setup_descriptor_sets(AppState& state) {
       .offset = 0,
       .range = sizeof(UniformBufferObject)
     };
-    VkWriteDescriptorSet desc_write = {
+    VkDescriptorImageInfo image_info = {
+      .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      .imageView = state.texture_img_view,
+      .sampler = state.texture_sampler
+    };
+    vector<VkWriteDescriptorSet> desc_writes(2);
+    desc_writes[0] = {
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
       .dstSet = state.desc_sets[i],
       .dstBinding = 0,
@@ -895,7 +1120,17 @@ void setup_descriptor_sets(AppState& state) {
       .pImageInfo = nullptr,
       .pTexelBufferView = nullptr
     };
-    vkUpdateDescriptorSets(state.device, 1, &desc_write, 0, nullptr);
+    desc_writes[1] = {
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet = state.desc_sets[i],
+      .dstBinding = 1,
+      .dstArrayElement = 0,
+      .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .descriptorCount = 1,
+      .pImageInfo = &image_info
+    };
+    vkUpdateDescriptorSets(state.device, (uint32_t) desc_writes.size(),
+        desc_writes.data(), 0, nullptr);
   }
 }
 
@@ -1054,6 +1289,10 @@ void cleanup_vulkan(AppState& state) {
   vkFreeMemory(state.device, state.index_buffer_mem, nullptr);
   vkDestroyBuffer(state.device, state.vert_buffer, nullptr);
   vkFreeMemory(state.device, state.vert_buffer_mem, nullptr);
+  vkDestroySampler(state.device, state.texture_sampler, nullptr);
+  vkDestroyImageView(state.device, state.texture_img_view, nullptr);
+  vkDestroyImage(state.device, state.texture_img, nullptr);
+  vkFreeMemory(state.device, state.texture_img_mem, nullptr);
   for (int i = 0; i < max_frames_in_flight; ++i) {
     vkDestroySemaphore(state.device, state.render_done_semas[i], nullptr);
     vkDestroySemaphore(state.device, state.img_available_semas[i], nullptr);
@@ -1080,10 +1319,10 @@ void init_vulkan(AppState& state) {
   VkResult res;
 
   vector<Vertex> vertices = {
-    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}},
-    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}},
-    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}}
+    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
+    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}
   };
   vector<uint16_t> indices = {
     0, 1, 2,
@@ -1103,6 +1342,9 @@ void init_vulkan(AppState& state) {
   setup_graphics_pipeline(state);
   setup_framebuffers(state);
   setup_command_pool(state);
+  setup_texture_image(state);
+  setup_texture_image_view(state);
+  setup_texture_sampler(state);
   setup_depth_resources(state);
   setup_vertex_buffer(state, vertices);
   setup_index_buffer(state, indices);
