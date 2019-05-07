@@ -87,6 +87,10 @@ struct AppState {
   VkImageView texture_img_view;
   VkSampler texture_sampler;
 
+  VkImage depth_img;
+  VkDeviceMemory depth_img_mem;
+  VkImageView depth_img_view;
+
   size_t current_frame;
 
   AppState();
@@ -292,7 +296,7 @@ VkFormat find_depth_format(VkPhysicalDevice& phys_device) {
       VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
 }
 
-bool has_stencil_components(VkFormat format) {
+bool has_stencil_component(VkFormat format) {
   return format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
     format == VK_FORMAT_D24_UNORM_S8_UINT;
 }
@@ -545,14 +549,15 @@ void prepare_surface_creation(AppState& state) {
       state.surface_caps.minImageCount, state.surface_caps.maxImageCount);
 }
 
-VkImageView create_image_view(AppState& state, VkImage image, VkFormat format) {
+VkImageView create_image_view(AppState& state, VkImage image,
+    VkFormat format, VkImageAspectFlags aspect_flags) {
   VkImageViewCreateInfo view_info = {
     .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
     .image = image,
     .viewType = VK_IMAGE_VIEW_TYPE_2D,
     .format = format,
     .subresourceRange = {
-      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .aspectMask = aspect_flags,
       .baseMipLevel = 0,
       .levelCount = 1,
       .baseArrayLayer = 0,
@@ -600,7 +605,8 @@ void setup_swapchain(AppState& state) {
   state.swapchain_img_views.resize(state.swapchain_images.size());
   for (int i = 0; i < state.swapchain_images.size(); ++i) {
     state.swapchain_img_views[i] = create_image_view(state,
-        state.swapchain_images[i], state.target_format.format);
+        state.swapchain_images[i], state.target_format.format,
+        VK_IMAGE_ASPECT_COLOR_BIT);
   }
 }
 
@@ -628,15 +634,33 @@ void setup_renderpass(AppState& state) {
     .attachment = 0,
     .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
   };
+  VkAttachmentDescription depth_attachment = {
+    .format = find_depth_format(state.phys_device),
+    .samples = VK_SAMPLE_COUNT_1_BIT,
+    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+    .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+  };
+  VkAttachmentReference depth_attachment_ref = {
+    .attachment = 1,
+    .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+  };
   VkSubpassDescription subpass_desc = {
     .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
     .colorAttachmentCount = 1,
-    .pColorAttachments = &color_attachment_ref
+    .pColorAttachments = &color_attachment_ref,
+    .pDepthStencilAttachment = &depth_attachment_ref
+  };
+  vector<VkAttachmentDescription> attachments = {
+    color_attachment, depth_attachment
   };
   VkRenderPassCreateInfo render_pass_info = {
     .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-    .attachmentCount = 1,
-    .pAttachments = &color_attachment,
+    .attachmentCount = (uint32_t) attachments.size(),
+    .pAttachments = attachments.data(),
     .subpassCount = 1,
     .pSubpasses = &subpass_desc,
     .dependencyCount = 1,
@@ -760,6 +784,14 @@ void setup_graphics_pipeline(AppState& state) {
     .attachmentCount = 1,
     .pAttachments = &color_blend_attachment
   };
+  VkPipelineDepthStencilStateCreateInfo depth_stencil = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+    .depthTestEnable = VK_TRUE,
+    .depthWriteEnable = VK_TRUE,
+    .depthCompareOp = VK_COMPARE_OP_LESS,
+    .depthBoundsTestEnable = VK_FALSE,
+    .stencilTestEnable = VK_FALSE
+  };
   // descriptor sets for uniforms go here
   VkPipelineLayoutCreateInfo pipeline_layout_info = {
     .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -779,7 +811,7 @@ void setup_graphics_pipeline(AppState& state) {
     .pViewportState = &viewport_state_info,
     .pRasterizationState = &rast_info,
     .pMultisampleState = &multisampling,
-    .pDepthStencilState = nullptr,
+    .pDepthStencilState = &depth_stencil,
     .pColorBlendState = &color_blending,
     .pDynamicState = nullptr,
     .layout = state.pipeline_layout,
@@ -799,11 +831,14 @@ void setup_graphics_pipeline(AppState& state) {
 void setup_framebuffers(AppState& state) {
   state.swapchain_framebuffers.resize(state.swapchain_img_views.size());
   for (int i = 0; i < state.swapchain_img_views.size(); ++i) {
+    vector<VkImageView> attachments = {
+      state.swapchain_img_views[i], state.depth_img_view
+    };
     VkFramebufferCreateInfo framebuffer_info = {
       .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
       .renderPass = state.render_pass,
-      .attachmentCount = 1,
-      .pAttachments = &state.swapchain_img_views[i],
+      .attachmentCount = (uint32_t) attachments.size(),
+      .pAttachments = attachments.data(),
       .width = state.target_extent.width,
       .height = state.target_extent.height,
       .layers = 1
@@ -906,6 +941,13 @@ void transition_image_layout(AppState& state, VkImage img,
     dst_access = VK_ACCESS_SHADER_READ_BIT;
     src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  } else if (old_layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+      new_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+    src_access = 0;
+    dst_access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    dst_stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
   } else {
     throw std::invalid_argument("unsupported layout transition");
   }
@@ -925,6 +967,12 @@ void transition_image_layout(AppState& state, VkImage img,
     .srcAccessMask = src_access,
     .dstAccessMask = dst_access
   };
+  if (new_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (has_stencil_component(format)) {
+      barrier.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    }
+  }
   vkCmdPipelineBarrier(tmp_cmd_buffer,
       src_stage, dst_stage,
       0,
@@ -979,7 +1027,8 @@ void setup_texture_image(AppState& state) {
 
 void setup_texture_image_view(AppState& state) {
   state.texture_img_view = create_image_view(state,
-      state.texture_img, VK_FORMAT_R8G8B8A8_UNORM);
+      state.texture_img, VK_FORMAT_R8G8B8A8_UNORM,
+      VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
 void setup_texture_sampler(AppState& state) {
@@ -1008,7 +1057,18 @@ void setup_texture_sampler(AppState& state) {
 
 void setup_depth_resources(AppState& state) {
   VkFormat depth_format = find_depth_format(state.phys_device);
-  // TODO - left off here
+
+  create_image(state, state.target_extent.width, state.target_extent.height,
+      depth_format, VK_IMAGE_TILING_OPTIMAL,
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, state.depth_img,
+      state.depth_img_mem);
+  state.depth_img_view = create_image_view(state, state.depth_img,
+      depth_format, VK_IMAGE_ASPECT_DEPTH_BIT);
+
+  transition_image_layout(state, state.depth_img,
+      depth_format, VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 }
 
 void setup_vertex_buffer(AppState& state, vector<Vertex>& vertices) {
@@ -1157,15 +1217,18 @@ void record_render_passes(AppState& state, vector<uint16_t>& indices) {
     VkResult res = vkBeginCommandBuffer(state.cmd_buffers[i], &begin_info);
     assert(res == VK_SUCCESS);
 
-    VkClearValue clear_color = {0.0f, 0.0f, 0.0f, 1.0f};
+    array<VkClearValue, 2> clear_values = {};
+    clear_values[0].color = {0.0f, 0.0f, 0.0f, 1.0f};
+    clear_values[1].depthStencil = {1.0f, 0};
+
     VkRenderPassBeginInfo render_pass_info = {
       .sType= VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
       .renderPass = state.render_pass,
       .framebuffer = state.swapchain_framebuffers[i],
       .renderArea.offset = {0, 0},
       .renderArea.extent = state.target_extent,
-      .clearValueCount = 1,
-      .pClearValues = &clear_color
+      .clearValueCount = (uint32_t) clear_values.size(),
+      .pClearValues = clear_values.data()
     };
     vector<VkBuffer> vert_buffers = {state.vert_buffer};
     vector<VkDeviceSize> byte_offsets = {0};
@@ -1233,7 +1296,7 @@ void render_frame(AppState& state) {
   float aspect_ratio = state.target_extent.width / (float) state.target_extent.height;
   mat4 proj_mat = glm::perspective(45.0f, aspect_ratio, 0.1f, 10.0f);
   // invert Y b/c vulkan's y-axis is inverted wrt OpenGL
-  proj_mat[1][1] *= -1;
+	proj_mat[1][1] *= -1;
   UniformBufferObject ubo = {
     .model = model_mat,
     .view = view_mat,
@@ -1302,6 +1365,9 @@ void cleanup_vulkan(AppState& state) {
   for (VkFramebuffer& fb : state.swapchain_framebuffers) {
     vkDestroyFramebuffer(state.device, fb, nullptr);
   }
+  vkDestroyImageView(state.device, state.depth_img_view, nullptr);
+  vkDestroyImage(state.device, state.depth_img, nullptr);
+  vkFreeMemory(state.device, state.depth_img_mem, nullptr);
   for (VkImageView& img_view : state.swapchain_img_views) {
     vkDestroyImageView(state.device, img_view, nullptr);
   }
@@ -1322,11 +1388,18 @@ void init_vulkan(AppState& state) {
     {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
     {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
     {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}
+    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
+
+		{{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
   };
   vector<uint16_t> indices = {
     0, 1, 2,
-    2, 3, 0
+    2, 3, 0,
+		4, 5, 6,
+		6, 7, 4
   };
   
   setup_vertex_attr_desc(state);
@@ -1340,12 +1413,12 @@ void init_vulkan(AppState& state) {
   setup_renderpass(state);
   setup_descriptor_set_layout(state);
   setup_graphics_pipeline(state);
-  setup_framebuffers(state);
   setup_command_pool(state);
   setup_texture_image(state);
   setup_texture_image_view(state);
   setup_texture_sampler(state);
   setup_depth_resources(state);
+  setup_framebuffers(state);
   setup_vertex_buffer(state, vertices);
   setup_index_buffer(state, indices);
   setup_uniform_buffers(state);
