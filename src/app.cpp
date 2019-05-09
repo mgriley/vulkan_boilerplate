@@ -1,10 +1,10 @@
 #include "app.h"
 #include "utils.h"
-/*
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
-#include "imgui_impl_opengl3.h"
-*/
+#include "imgui_impl_vulkan.h"
 
 #include <chrono>
 #include <thread>
@@ -34,6 +34,8 @@ struct UniformBufferObject {
 
 struct AppState {
   GLFWwindow* win = nullptr;
+
+  vector<uint16_t> indices;
 
   PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_utils;
 
@@ -98,6 +100,10 @@ struct AppState {
 
 AppState::AppState()
 {
+}
+
+static void check_vk_result(VkResult res) {
+  assert(res == VK_SUCCESS);
 }
 
 vector<char> read_file(const string& filename) {
@@ -189,8 +195,6 @@ void end_single_time_commands(AppState& state, VkCommandBuffer cmd_buffer) {
 
   vkFreeCommandBuffers(state.device, state.cmd_pool, 1, &cmd_buffer);
 }
-
-
 
 void copy_buffer(
     AppState& state,
@@ -854,7 +858,7 @@ void setup_command_pool(AppState& state) {
     .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
     .pNext = nullptr,
     .queueFamilyIndex = state.target_family_index,
-    .flags = 0
+    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
   };
   VkResult res = vkCreateCommandPool(state.device, &cmd_pool_info, nullptr,
       &state.cmd_pool);
@@ -1123,20 +1127,17 @@ void setup_uniform_buffers(AppState& state) {
 }
 
 void setup_descriptor_pool(AppState& state) {
-  vector<VkDescriptorPoolSize> pool_sizes(2);
-  pool_sizes[0] = {
-    .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-    .descriptorCount = (uint32_t) state.swapchain_img_views.size()
-  };
-  pool_sizes[1] = {
-    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-    .descriptorCount = (uint32_t) state.swapchain_img_views.size()
-  };
+  uint32_t size = 1000;
+  vector<VkDescriptorPoolSize> pool_sizes;
+  for (int i = 0; i < VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; ++i) {
+    VkDescriptorPoolSize pool_size = {(VkDescriptorType) i, size};
+    pool_sizes.push_back(pool_size);
+  }
   VkDescriptorPoolCreateInfo desc_pool_info = {
     .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
     .poolSizeCount = (uint32_t) pool_sizes.size(),
     .pPoolSizes = pool_sizes.data(),
-    .maxSets = (uint32_t) state.swapchain_img_views.size()
+    .maxSets = (uint32_t) (size * pool_sizes.size())
   };
   VkResult res = vkCreateDescriptorPool(state.device, &desc_pool_info,
       nullptr, &state.desc_pool);
@@ -1207,48 +1208,66 @@ void setup_command_buffers(AppState& state) {
   assert(res == VK_SUCCESS);
 }
 
+void record_render_pass(AppState& state, uint32_t buffer_index,
+    vector<uint16_t>& indices) {
+  uint32_t i = buffer_index;
+
+  // moves the command buffer back to the initial state so that we
+  // may record again
+  VkResult res = vkResetCommandBuffer(state.cmd_buffers[i],
+      VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+  assert(res == VK_SUCCESS);
+
+  VkCommandBufferBeginInfo begin_info = {
+    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    .pInheritanceInfo = nullptr
+  };
+  res = vkBeginCommandBuffer(state.cmd_buffers[i], &begin_info);
+  assert(res == VK_SUCCESS);
+
+  array<VkClearValue, 2> clear_values = {};
+  clear_values[0].color = {0.0f, 0.0f, 0.0f, 1.0f};
+  clear_values[1].depthStencil = {1.0f, 0};
+
+  VkRenderPassBeginInfo render_pass_info = {
+    .sType= VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+    .renderPass = state.render_pass,
+    .framebuffer = state.swapchain_framebuffers[i],
+    .renderArea.offset = {0, 0},
+    .renderArea.extent = state.target_extent,
+    .clearValueCount = (uint32_t) clear_values.size(),
+    .pClearValues = clear_values.data()
+  };
+  vector<VkBuffer> vert_buffers = {state.vert_buffer};
+  vector<VkDeviceSize> byte_offsets = {0};
+
+  vkCmdBeginRenderPass(state.cmd_buffers[i], &render_pass_info,
+      VK_SUBPASS_CONTENTS_INLINE);
+
+  vkCmdBindPipeline(state.cmd_buffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS,
+      state.graphics_pipeline);
+  vkCmdBindVertexBuffers(state.cmd_buffers[i], 0, vert_buffers.size(),
+      vert_buffers.data(), byte_offsets.data());
+  vkCmdBindIndexBuffer(state.cmd_buffers[i], state.index_buffer, 0,
+      VK_INDEX_TYPE_UINT16);
+  vkCmdBindDescriptorSets(state.cmd_buffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS,
+      state.pipeline_layout, 0, 1, &state.desc_sets[i], 0, nullptr);
+  //vkCmdDraw(cmd_buffers[i], (uint32_t) vertices.size(), 1, 0, 0);
+  vkCmdDrawIndexed(state.cmd_buffers[i], (uint32_t) indices.size(),
+      1, 0, 0, 0);
+
+  ImGui_ImplVulkan_RenderDrawData(
+      ImGui::GetDrawData(), state.cmd_buffers[i]);
+
+  vkCmdEndRenderPass(state.cmd_buffers[i]);
+  res = vkEndCommandBuffer(state.cmd_buffers[i]);
+  assert(res == VK_SUCCESS);
+}
+
 void record_render_passes(AppState& state, vector<uint16_t>& indices) {
-  for (int i = 0; i < state.cmd_buffers.size(); ++i) {
-    VkCommandBufferBeginInfo begin_info = {
-      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-      .flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT,
-      .pInheritanceInfo = nullptr
-    };
-    VkResult res = vkBeginCommandBuffer(state.cmd_buffers[i], &begin_info);
-    assert(res == VK_SUCCESS);
-
-    array<VkClearValue, 2> clear_values = {};
-    clear_values[0].color = {0.0f, 0.0f, 0.0f, 1.0f};
-    clear_values[1].depthStencil = {1.0f, 0};
-
-    VkRenderPassBeginInfo render_pass_info = {
-      .sType= VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-      .renderPass = state.render_pass,
-      .framebuffer = state.swapchain_framebuffers[i],
-      .renderArea.offset = {0, 0},
-      .renderArea.extent = state.target_extent,
-      .clearValueCount = (uint32_t) clear_values.size(),
-      .pClearValues = clear_values.data()
-    };
-    vector<VkBuffer> vert_buffers = {state.vert_buffer};
-    vector<VkDeviceSize> byte_offsets = {0};
-
-    vkCmdBeginRenderPass(state.cmd_buffers[i], &render_pass_info,
-        VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(state.cmd_buffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS,
-        state.graphics_pipeline);
-    vkCmdBindVertexBuffers(state.cmd_buffers[i], 0, vert_buffers.size(),
-        vert_buffers.data(), byte_offsets.data());
-    vkCmdBindIndexBuffer(state.cmd_buffers[i], state.index_buffer, 0,
-        VK_INDEX_TYPE_UINT16);
-    vkCmdBindDescriptorSets(state.cmd_buffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS,
-        state.pipeline_layout, 0, 1, &state.desc_sets[i], 0, nullptr);
-    //vkCmdDraw(cmd_buffers[i], (uint32_t) vertices.size(), 1, 0, 0);
-    vkCmdDrawIndexed(state.cmd_buffers[i], (uint32_t) indices.size(),
-        1, 0, 0, 0);
-    vkCmdEndRenderPass(state.cmd_buffers[i]);
-    res = vkEndCommandBuffer(state.cmd_buffers[i]);
-    assert(res == VK_SUCCESS);
+  for (uint32_t i = 0; i < state.cmd_buffers.size(); ++i) {
+    record_render_pass(state, i, indices);
   }
 }
 
@@ -1307,6 +1326,8 @@ void render_frame(AppState& state) {
       sizeof(ubo), 0, &unif_data);
   memcpy(unif_data, &ubo, sizeof(ubo));
   vkUnmapMemory(state.device, state.unif_buffers_mem[img_index]);
+
+  record_render_pass(state, img_index, state.indices);
 
   // submit cmd buffer to pipeline
   vector<VkPipelineStageFlags> wait_stages = {
@@ -1395,7 +1416,7 @@ void init_vulkan(AppState& state) {
     {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
     {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
   };
-  vector<uint16_t> indices = {
+  state.indices = {
     0, 1, 2,
     2, 3, 0,
 		4, 5, 6,
@@ -1420,17 +1441,19 @@ void init_vulkan(AppState& state) {
   setup_depth_resources(state);
   setup_framebuffers(state);
   setup_vertex_buffer(state, vertices);
-  setup_index_buffer(state, indices);
+  setup_index_buffer(state, state.indices);
   setup_uniform_buffers(state);
   setup_descriptor_pool(state);
   setup_descriptor_sets(state);
   setup_command_buffers(state);
-  record_render_passes(state, indices);
   setup_sync_objects(state);
 }
 
 void init_glfw(AppState& state) {
-  glfwInit();
+  glfwSetErrorCallback(glfw_error_callback);
+  if (!glfwInit()) {
+    throw std::runtime_error("Error on glfwInit()");
+  }
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
   // prevent resizing the window for now, since
   // it requires recreating the swapchain
@@ -1441,14 +1464,57 @@ void init_glfw(AppState& state) {
   assert(glfwVulkanSupported() == GLFW_TRUE);
 }
 
+void upload_imgui_fonts(AppState& state) {
+  VkCommandBuffer tmp_buffer = begin_single_time_commands(state);
+  ImGui_ImplVulkan_CreateFontsTexture(tmp_buffer);
+  end_single_time_commands(state, tmp_buffer);
+  ImGui_ImplVulkan_DestroyFontUploadObjects();
+}
+
 void main_loop(AppState& state) {
+  IMGUI_CHECKVERSION();
+  ImGui::CreateContext();
+  ImGui::StyleColorsDark();
+
+  ImGui_ImplGlfw_InitForVulkan(state.win, true);
+  ImGui_ImplVulkan_InitInfo init_info = {
+    .Instance = state.inst,
+    .PhysicalDevice = state.phys_device,
+    .Device = state.device,
+    .QueueFamily = state.target_family_index,
+    .Queue = state.queue,
+    .PipelineCache = VK_NULL_HANDLE,
+    .DescriptorPool = state.desc_pool,
+    .Allocator = nullptr,
+    .MinImageCount = state.surface_caps.minImageCount,
+    .ImageCount = state.target_image_count,
+    .CheckVkResultFn = check_vk_result
+  };
+  ImGui_ImplVulkan_Init(&init_info, state.render_pass);
+  upload_imgui_fonts(state);
+
+  bool show_demo_win = true;
   state.current_frame = 0;
   while (!glfwWindowShouldClose(state.win)) {
     glfwPollEvents();
 
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    if (show_demo_win) {
+      ImGui::ShowDemoWindow(&show_demo_win);
+    }
+
+    ImGui::Render();
+
     render_frame(state);
   }
   vkDeviceWaitIdle(state.device);
+
+  ImGui_ImplVulkan_Shutdown();
+  ImGui_ImplGlfw_Shutdown();
+  ImGui::DestroyContext();
 }
 
 void cleanup_state(AppState& state) {
@@ -1469,6 +1535,7 @@ void run_app(int argc, char** argv) {
 
   init_glfw(state);
   init_vulkan(state);
+  
   main_loop(state);
   cleanup_state(state);
 }

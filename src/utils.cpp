@@ -9,6 +9,10 @@ void handle_segfault(int sig_num) {
   exit(1);
 }
 
+void glfw_error_callback(int error, const char* description) {
+  fprintf(stderr, "GLFW Error %d: %s\n", error, description);
+}
+
 string vec3_str(vec3 v) {
   array<char, 100> s;
   sprintf(s.data(), "[%5.2f, %5.2f, %5.2f]", v[0], v[1], v[2]);

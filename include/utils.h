@@ -26,13 +26,11 @@
 #include "glm/gtc/matrix_transform.hpp"
 #include "glm/gtx/string_cast.hpp"
 
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-
 using namespace std;
 using namespace glm;
 
 void handle_segfault(int sig_num);
+void glfw_error_callback(int error, const char* description);
 
 string vec3_str(vec3 v);
 string vec4_str(vec4 v);

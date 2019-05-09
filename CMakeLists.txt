@@ -20,18 +20,15 @@ if (NOT Vulkan_FOUND)
 endif()
 
 # compile ImGui to a static lib
-#[[
 set(IMGUI "${CDIR}/third_party/imgui")
 file(GLOB IMGUI_TOPLEVEL_SOURCES "${IMGUI}/*.cpp")
 list(APPEND IMGUI_SOURCES
   ${IMGUI_TOPLEVEL_SOURCES}
   "${IMGUI}/examples/imgui_impl_glfw.cpp"
-  "${IMGUI}/examples/imgui_impl_opengl3.cpp")
+  "${IMGUI}/examples/imgui_impl_vulkan.cpp")
 add_library(imgui STATIC ${IMGUI_SOURCES})
-target_include_directories(imgui PUBLIC ${IMGUI} "${IMGUI}/examples" include)
-target_compile_definitions(imgui PUBLIC
-  IMGUI_IMPL_OPENGL_LOADER_GLAD=1)
-]]
+target_include_directories(imgui PUBLIC
+  ${IMGUI} "${IMGUI}/examples" include ${Vulkan_INCLUDE_DIRS})
 
 # compile the app
 
@@ -40,8 +37,7 @@ file(GLOB SOURCES "src/*.cpp" "src/*.c")
 list(REMOVE_ITEM SOURCES ${DRIVER})
 add_library(main_lib STATIC ${SOURCES})
 target_include_directories(main_lib PUBLIC include)
-# TODO - add back imgui
-target_link_libraries(main_lib PUBLIC glfw Vulkan::Vulkan) 
+target_link_libraries(main_lib PUBLIC glfw Vulkan::Vulkan imgui) 
 # pass the manifest file locations to the exec instead of
 # specifying them on the command-line every time
 target_compile_definitions(main_lib PUBLIC
