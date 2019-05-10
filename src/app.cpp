@@ -34,6 +34,7 @@ struct UniformBufferObject {
 
 struct AppState {
   GLFWwindow* win = nullptr;
+  bool framebuffer_resized = false;
 
   vector<uint16_t> indices;
 
@@ -61,7 +62,6 @@ struct AppState {
   vector<VkImageView> swapchain_img_views;
 
   VkRenderPass render_pass;
-  VkDescriptorSetLayout desc_set_layout;
   VkPipelineLayout pipeline_layout;
   VkPipeline graphics_pipeline;
   vector<VkFramebuffer> swapchain_framebuffers;
@@ -75,6 +75,7 @@ struct AppState {
   vector<VkBuffer> unif_buffers;
   vector<VkDeviceMemory> unif_buffers_mem;
 
+  VkDescriptorSetLayout desc_set_layout;
   VkDescriptorPool desc_pool;
   vector<VkDescriptorSet> desc_sets;
 
@@ -509,7 +510,7 @@ void setup_logical_device(AppState& state) {
   vkGetDeviceQueue(state.device, state.target_family_index, 0, &state.queue);
 }
 
-void prepare_surface_creation(AppState& state) {
+void prepare_swapchain_creation(AppState& state) {
   // query surface properties
   vkGetPhysicalDeviceSurfaceCapabilitiesKHR(state.phys_device,
       state.surface, &state.surface_caps);
@@ -576,6 +577,8 @@ VkImageView create_image_view(AppState& state, VkImage image,
 }
 
 void setup_swapchain(AppState& state) {
+  prepare_swapchain_creation(state);
+
   VkSwapchainCreateInfoKHR swapchain_info = {
     .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
     .surface = state.surface,
@@ -1135,6 +1138,7 @@ void setup_descriptor_pool(AppState& state) {
   }
   VkDescriptorPoolCreateInfo desc_pool_info = {
     .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+    .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
     .poolSizeCount = (uint32_t) pool_sizes.size(),
     .pPoolSizes = pool_sizes.data(),
     .maxSets = (uint32_t) (size * pool_sizes.size())
@@ -1145,6 +1149,7 @@ void setup_descriptor_pool(AppState& state) {
 }
 
 void setup_descriptor_sets(AppState& state) {
+  // create one descriptor set for each index of the swapchain
   vector<VkDescriptorSetLayout> desc_set_layouts(
       state.swapchain_img_views.size(), state.desc_set_layout);
   VkDescriptorSetAllocateInfo desc_set_alloc_info = {
@@ -1158,6 +1163,7 @@ void setup_descriptor_sets(AppState& state) {
       &desc_set_alloc_info, state.desc_sets.data());
   assert(res == VK_SUCCESS);
   
+  // for each descriptor set, set the resources for each of its bindings
   for (size_t i = 0; i < state.desc_sets.size(); ++i) {
     VkDescriptorBufferInfo buffer_info = {
       .buffer = state.unif_buffers[i],
@@ -1251,6 +1257,8 @@ void record_render_pass(AppState& state, uint32_t buffer_index,
       vert_buffers.data(), byte_offsets.data());
   vkCmdBindIndexBuffer(state.cmd_buffers[i], state.index_buffer, 0,
       VK_INDEX_TYPE_UINT16);
+  // the desc sets specify the link between the binding points and actual
+  // resources
   vkCmdBindDescriptorSets(state.cmd_buffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS,
       state.pipeline_layout, 0, 1, &state.desc_sets[i], 0, nullptr);
   //vkCmdDraw(cmd_buffers[i], (uint32_t) vertices.size(), 1, 0, 0);
@@ -1295,18 +1303,155 @@ void setup_sync_objects(AppState& state) {
   }
 }
 
+void cleanup_swapchain(AppState& state) {
+  vkDestroyImageView(state.device, state.depth_img_view, nullptr);
+  vkDestroyImage(state.device, state.depth_img, nullptr);
+  vkFreeMemory(state.device, state.depth_img_mem, nullptr);
+
+  for (VkFramebuffer& fb : state.swapchain_framebuffers) {
+    vkDestroyFramebuffer(state.device, fb, nullptr);
+  }
+  vkFreeCommandBuffers(state.device, state.cmd_pool,
+      (uint32_t) state.cmd_buffers.size(), state.cmd_buffers.data());
+
+  vkDestroyPipeline(state.device, state.graphics_pipeline, nullptr);
+  vkDestroyPipelineLayout(state.device, state.pipeline_layout, nullptr);
+  vkDestroyRenderPass(state.device, state.render_pass, nullptr);
+  for (VkImageView& img_view : state.swapchain_img_views) {
+    vkDestroyImageView(state.device, img_view, nullptr);
+  }
+  // TODO this triggers a segfault, bug with MoltenVK:
+  // https://github.com/KhronosGroup/MoltenVK/issues/584
+  // Validation layer will complain for now
+  //vkDestroySwapchainKHR(state.device, state.swapchain, nullptr);
+  for (size_t i = 0; i < state.swapchain_img_views.size(); ++i) {
+    vkDestroyBuffer(state.device, state.unif_buffers[i], nullptr);
+    vkFreeMemory(state.device, state.unif_buffers_mem[i], nullptr);
+  }
+  vkFreeDescriptorSets(state.device, state.desc_pool,
+      (uint32_t) state.desc_sets.size(), state.desc_sets.data());
+}
+
+void cleanup_vulkan(AppState& state) {
+  cleanup_swapchain(state);
+
+  vkDestroyDescriptorPool(state.device, state.desc_pool, nullptr);
+  
+  vkDestroySampler(state.device, state.texture_sampler, nullptr);
+  vkDestroyImageView(state.device, state.texture_img_view, nullptr);
+  vkDestroyImage(state.device, state.texture_img, nullptr);
+  vkFreeMemory(state.device, state.texture_img_mem, nullptr);
+
+  vkDestroyDescriptorSetLayout(state.device, state.desc_set_layout, nullptr);
+
+  vkDestroyBuffer(state.device, state.index_buffer, nullptr);
+  vkFreeMemory(state.device, state.index_buffer_mem, nullptr);
+  vkDestroyBuffer(state.device, state.vert_buffer, nullptr);
+  vkFreeMemory(state.device, state.vert_buffer_mem, nullptr);
+
+  for (int i = 0; i < max_frames_in_flight; ++i) {
+    vkDestroySemaphore(state.device, state.render_done_semas[i], nullptr);
+    vkDestroySemaphore(state.device, state.img_available_semas[i], nullptr);
+    vkDestroyFence(state.device, state.in_flight_fences[i], nullptr);
+  }
+  vkDestroyCommandPool(state.device, state.cmd_pool, nullptr);
+
+  vkDestroyDevice(state.device, nullptr);
+
+  state.destroy_debug_utils(state.inst, state.debug_messenger, nullptr);
+
+  vkDestroySurfaceKHR(state.inst, state.surface, nullptr);
+  vkDestroyInstance(state.inst, nullptr);
+}
+
+void recreate_swapchain(AppState& state) {
+  // if the window is minimized, wait until it comes to the foreground
+  // again
+  int fb_w = 0;
+  int fb_h = 0;
+  while (fb_w == 0 || fb_h == 0) {
+    glfwGetFramebufferSize(state.win, &fb_w, &fb_h);
+    glfwWaitEvents();
+  }
+
+  vkDeviceWaitIdle(state.device);
+  cleanup_swapchain(state);
+
+  // TODO - figure out why these in particular must be
+  // called again. Not immediately obvious for some
+  setup_swapchain(state);
+  setup_renderpass(state);
+  setup_graphics_pipeline(state);
+  setup_depth_resources(state);
+  setup_framebuffers(state);
+  setup_uniform_buffers(state);
+  setup_descriptor_sets(state);
+  setup_command_buffers(state);
+  ImGui_ImplVulkan_SetMinImageCount(state.surface_caps.minImageCount);
+}
+
+void init_vulkan(AppState& state) {
+  VkResult res;
+
+  vector<Vertex> vertices = {
+    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
+    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
+
+		{{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
+  };
+  state.indices = {
+    0, 1, 2,
+    2, 3, 0,
+		4, 5, 6,
+		6, 7, 4
+  };
+  
+  setup_vertex_attr_desc(state);
+  setup_instance(state);
+  setup_debug_callback(state);
+  setup_surface(state); 
+  setup_physical_device(state);
+  setup_logical_device(state);
+  setup_swapchain(state);
+  setup_renderpass(state);
+  setup_descriptor_set_layout(state);
+  setup_graphics_pipeline(state);
+  setup_command_pool(state);
+  setup_texture_image(state);
+  setup_texture_image_view(state);
+  setup_texture_sampler(state);
+  setup_depth_resources(state);
+  setup_framebuffers(state);
+  setup_vertex_buffer(state, vertices);
+  setup_index_buffer(state, state.indices);
+  setup_uniform_buffers(state);
+  setup_descriptor_pool(state);
+  setup_descriptor_sets(state);
+  setup_command_buffers(state);
+  setup_sync_objects(state);
+}
+
 void render_frame(AppState& state) {
   size_t current_frame = state.current_frame;
 
   vkWaitForFences(state.device, 1, &state.in_flight_fences[current_frame],
         VK_TRUE, std::numeric_limits<uint64_t>::max());
-  vkResetFences(state.device, 1, &state.in_flight_fences[current_frame]);
   
   uint32_t img_index;
-  vkAcquireNextImageKHR(state.device, state.swapchain,
+  VkResult res= vkAcquireNextImageKHR(state.device, state.swapchain,
       std::numeric_limits<uint64_t>::max(),
       state.img_available_semas[current_frame],
       VK_NULL_HANDLE, &img_index);
+  if (res == VK_ERROR_OUT_OF_DATE_KHR || state.framebuffer_resized) {
+    state.framebuffer_resized = false;
+    recreate_swapchain(state);
+    return;
+  }
   
   // update the unif buffers
   mat4 model_mat = mat4(1.0f);
@@ -1343,7 +1488,8 @@ void render_frame(AppState& state) {
     .signalSemaphoreCount = 1,
     .pSignalSemaphores = &state.render_done_semas[current_frame]
   };
-  VkResult res = vkQueueSubmit(state.queue, 1, &submit_info,
+  vkResetFences(state.device, 1, &state.in_flight_fences[current_frame]);
+  res = vkQueueSubmit(state.queue, 1, &submit_info,
       state.in_flight_fences[current_frame]);
   assert(res == VK_SUCCESS);
 
@@ -1357,96 +1503,19 @@ void render_frame(AppState& state) {
     .pImageIndices = &img_index,
     .pResults = nullptr
   };
-  vkQueuePresentKHR(state.queue, &present_info);
+  res = vkQueuePresentKHR(state.queue, &present_info);
+  if (res == VK_ERROR_OUT_OF_DATE_KHR) {
+    recreate_swapchain(state);
+  }
 
   state.current_frame = (current_frame + 1) % max_frames_in_flight;
 }
 
-void cleanup_vulkan(AppState& state) {
-  for (size_t i = 0; i < state.swapchain_img_views.size(); ++i) {
-    vkDestroyBuffer(state.device, state.unif_buffers[i], nullptr);
-    vkFreeMemory(state.device, state.unif_buffers_mem[i], nullptr);
-  }
-  vkDestroyDescriptorPool(state.device, state.desc_pool, nullptr);
-  vkDestroyDescriptorSetLayout(state.device, state.desc_set_layout, nullptr);
-  vkDestroyBuffer(state.device, state.index_buffer, nullptr);
-  vkFreeMemory(state.device, state.index_buffer_mem, nullptr);
-  vkDestroyBuffer(state.device, state.vert_buffer, nullptr);
-  vkFreeMemory(state.device, state.vert_buffer_mem, nullptr);
-  vkDestroySampler(state.device, state.texture_sampler, nullptr);
-  vkDestroyImageView(state.device, state.texture_img_view, nullptr);
-  vkDestroyImage(state.device, state.texture_img, nullptr);
-  vkFreeMemory(state.device, state.texture_img_mem, nullptr);
-  for (int i = 0; i < max_frames_in_flight; ++i) {
-    vkDestroySemaphore(state.device, state.render_done_semas[i], nullptr);
-    vkDestroySemaphore(state.device, state.img_available_semas[i], nullptr);
-    vkDestroyFence(state.device, state.in_flight_fences[i], nullptr);
-  }
-  vkDestroyCommandPool(state.device, state.cmd_pool, nullptr);
-  for (VkFramebuffer& fb : state.swapchain_framebuffers) {
-    vkDestroyFramebuffer(state.device, fb, nullptr);
-  }
-  vkDestroyImageView(state.device, state.depth_img_view, nullptr);
-  vkDestroyImage(state.device, state.depth_img, nullptr);
-  vkFreeMemory(state.device, state.depth_img_mem, nullptr);
-  for (VkImageView& img_view : state.swapchain_img_views) {
-    vkDestroyImageView(state.device, img_view, nullptr);
-  }
-  vkDestroyRenderPass(state.device, state.render_pass, nullptr);
-  vkDestroyPipeline(state.device, state.graphics_pipeline, nullptr);
-  vkDestroyPipelineLayout(state.device, state.pipeline_layout, nullptr);
-  vkDestroySwapchainKHR(state.device, state.swapchain, nullptr);
-  state.destroy_debug_utils(state.inst, state.debug_messenger, nullptr);
-  vkDestroyDevice(state.device, nullptr);
-  vkDestroySurfaceKHR(state.inst, state.surface, nullptr);
-  vkDestroyInstance(state.inst, nullptr);
-}
-
-void init_vulkan(AppState& state) {
-  VkResult res;
-
-  vector<Vertex> vertices = {
-    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
-
-		{{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
-    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
-  };
-  state.indices = {
-    0, 1, 2,
-    2, 3, 0,
-		4, 5, 6,
-		6, 7, 4
-  };
-  
-  setup_vertex_attr_desc(state);
-  setup_instance(state);
-  setup_debug_callback(state);
-  setup_surface(state); 
-  setup_physical_device(state);
-  setup_logical_device(state);
-  prepare_surface_creation(state);
-  setup_swapchain(state);
-  setup_renderpass(state);
-  setup_descriptor_set_layout(state);
-  setup_graphics_pipeline(state);
-  setup_command_pool(state);
-  setup_texture_image(state);
-  setup_texture_image_view(state);
-  setup_texture_sampler(state);
-  setup_depth_resources(state);
-  setup_framebuffers(state);
-  setup_vertex_buffer(state, vertices);
-  setup_index_buffer(state, state.indices);
-  setup_uniform_buffers(state);
-  setup_descriptor_pool(state);
-  setup_descriptor_sets(state);
-  setup_command_buffers(state);
-  setup_sync_objects(state);
+static void framebuffer_resize_callback(GLFWwindow* win,
+    int w, int h) {
+  AppState* state = reinterpret_cast<AppState*>(
+      glfwGetWindowUserPointer(win));
+  state->framebuffer_resized = true;
 }
 
 void init_glfw(AppState& state) {
@@ -1455,13 +1524,12 @@ void init_glfw(AppState& state) {
     throw std::runtime_error("Error on glfwInit()");
   }
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-  // prevent resizing the window for now, since
-  // it requires recreating the swapchain
-  // TODO: https://vulkan-tutorial.com/Drawing_a_triangle/Swap_chain_recreation
-  glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
   state.win = glfwCreateWindow(800, 600, "morph",
       nullptr, nullptr);
   assert(glfwVulkanSupported() == GLFW_TRUE);
+  glfwSetWindowUserPointer(state.win, &state);
+  glfwSetFramebufferSizeCallback(state.win,
+      framebuffer_resize_callback);
 }
 
 void upload_imgui_fonts(AppState& state) {
@@ -1525,6 +1593,8 @@ void cleanup_state(AppState& state) {
 }
 
 void run_app(int argc, char** argv) {
+  signal(SIGSEGV, handle_segfault);
+
   // setup the environment for the vulkan loader
   char icd_env_entry[] = ENV_VK_ICD_FILENAMES;
   char layer_env_entry[] = ENV_VK_LAYER_PATH;
